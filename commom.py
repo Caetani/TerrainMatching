@@ -4,11 +4,28 @@ import cv2
 from matplotlib import pyplot as plt
 from time import time
 import random as rd
+import rasterio
+from shapely.geometry import Point
+from shapely.geometry.polygon import Polygon
+import math
+from generalParameters import *
+from numba import vectorize
+import concurrent.futures
+from scipy.stats import qmc
+import gc
+import sys
+from memory_profiler import profile
+import warnings
+warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
 
 def showImage(img, title='Image'):
     cv2.imshow(title, img)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
+
+def showImageGPU(img, title='Image'):
+    imgDown = img.download()
+    showImage(np.uint8(imgDown), title=title)
 
 def scaledDepthMap(depth, color='terrain', saveas = False):
     ''' Avaiable colors:
@@ -43,6 +60,29 @@ def drawKeypoints(img, kp, _showImage=False, size=5):
     if _showImage:
         showImage(imgWithKeypoints)
     return imgWithKeypoints
+
+def drawCustomKeypoints(image, keypoints, size=0.5, thickness=0.1, color=(255, 0, 0)):
+    # Create a blank image to draw keypoints
+    output_img = np.copy(image)
+
+    # Draw keypoints on the image
+    h, w = image.shape
+    p = max(h, w)
+    size = int(size*p/100)
+    thickness = int(thickness*p/100)
+
+    for kp in keypoints:
+        x, y = kp.pt
+        '''attributes = dir(kp)
+        for attribute in attributes:
+            if not attribute.startswith("__"):
+                print(attribute, "=", getattr(kp, attribute))
+        exit()'''
+        size = int(size)
+        thickness = int(thickness)
+        output_img = cv2.circle(output_img, (int(x), int(y)), size, color, thickness)
+    
+    return output_img
 
 def generateResultImageString(stereo):
     # Commom parameters between all stereo algorithms in OpenCV.
@@ -88,8 +128,8 @@ def orbDescriptor(img, kp):
     kp, des = orb.compute(img, kp)
     return kp, des
 
-def orbDetectorAndDescriptor(img, numFeatures, scaleFactor=1.2, nlevels=8, firstLevel=0, showImage=False):
-    orb = cv2.ORB_create(numFeatures, scaleFactor=scaleFactor, nlevels=nlevels, firstLevel=firstLevel, WTA_K=2)
+def orbDetectorAndDescriptor(img, numFeatures, scaleFactor=1.2, nlevels=8, firstLevel=0, edgeThreshold=31, WTA_K=4, scoreType=cv2.ORB_HARRIS_SCORE, patchSize=31, fastThreshold=20,  showImage=False):
+    orb = cv2.ORB_create(nfeatures=numFeatures, scaleFactor=scaleFactor, nlevels=nlevels, firstLevel=firstLevel, WTA_K=WTA_K, edgeThreshold=edgeThreshold, scoreType=scoreType, patchSize=patchSize, fastThreshold=fastThreshold)
     kp, des = orb.detectAndCompute(img, None)
     if showImage:
         imgWithKeypoints = cv2.drawKeypoints(img, kp, None, color=(0,255,0), flags=0)
@@ -107,24 +147,33 @@ def orbImgWithKeypoints(img, n):
     imgWithKeypoints = cv2.drawKeypoints(img, kp, None, color=(0,255,0), flags=0)
     return imgWithKeypoints
 
-def imgSegmentation(img, nBlocks=(2,2)):
-    horizontal = np.array_split(img, nBlocks[0])
-    splitted_img = [np.array_split(block, nBlocks[1], axis=1) for block in horizontal]
-   
-    minHeigh, minWidth = 0, 0
-    heighs, widths = [], []
+def imgSegmentation(img, nBlocks=(2, 2)):
+    numRows, numCols = nBlocks
+    horizontal = np.array_split(img, numRows)
+    splitted_img = [np.array_split(block, numCols, axis=1) for block in horizontal]
 
-    for row in range(nBlocks[0]):
-        heighs.append(minHeigh)
-        minHeigh += len(splitted_img[row][0])
+    currentOffsetHeight = 0
+    currentOffsetWidth = 0
+    offsetHeights = []
+    offsetWidths = []
+    for row in range(numRows):
+        offsetHeights.append(currentOffsetHeight)
+        currentOffsetHeight += len(splitted_img[row][0])
+    for col in range(numCols):
+        offsetWidths.append(currentOffsetWidth)
+        currentOffsetWidth += splitted_img[0][col].shape[1]
+    images, y_offsets, x_offsets = [], [], []
+    for row in range(numRows):
+        for col in range(numCols):
+            heightOffset = offsetHeights[row]
+            widthOffset = offsetWidths[col]
+            currentImg = splitted_img[row][col]
+            images.append(currentImg)
+            y_offsets.append(heightOffset)
+            x_offsets.append(widthOffset)
+    return images, y_offsets, x_offsets
 
-    for col in range(nBlocks[1]):
-        widths.append(minWidth)
-        minWidth += len(splitted_img[0][col][0])
-
-    minPoints = np.vstack((heighs, widths))
-    return np.asarray(splitted_img, dtype=np.ndarray).reshape(nBlocks), minPoints
-
+    
 def revertImageSegmentation(imgArray, nBlocks=(2,2), title='Merged Image'):
     for h in range(nBlocks[0]):
         buffer = imgArray[h, 0]
@@ -135,18 +184,216 @@ def revertImageSegmentation(imgArray, nBlocks=(2,2), title='Merged Image'):
         else: result = np.vstack((result, buffer))
     showImage(result, title = title)
 
-def segmentedOrb(img, numFeatures, nBlocks=(2,2)):
-    imgs, segmentationPoints = imgSegmentation(img, nBlocks=nBlocks)
-    h, w = segmentationPoints
+def FAST_GPU(gpuImg, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=4):     # TODO
+    currentFeatures = 0
+    startingThreshold = startingThreshold
+    thresholdStep = thresholdStep
+    minThreshold = minThreshold
+    for t in range(startingThreshold, minThreshold-1, -thresholdStep):
+        if t <= 0: threshold = 1
+        else: threshold = t
+        cudaFast = cv2.cuda.FastFeatureDetector.create(int(threshold), True, cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)
+        cudaFast.setThreshold(int(threshold))
+        kps = cudaFast.detectAsync(gpuImg)
+        currentFeatures = kps.size()[0]
+        if currentFeatures >= numFeatures:
+            resultKps = cudaFast.convert(kps)
+            sortedKps = sorted(resultKps, key=lambda x:x.response, reverse=True)
+            
+            # TODO Remove the line below:
+            '''img = gpuImg.download()
+            aux = drawCustomKeypoints(img, sortedKps)
+            showImage(resizeImage(aux, 0.1))'''
+            
+            return sortedKps[:numFeatures]
+    resultKps = cudaFast.convert(kps)
+    sortedKps = sorted(resultKps, key=lambda x:x.response, reverse=True)
+    return sortedKps
+
+
+def FAST_CPU(img, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=2):
+    currentFeatures = 0
+    startingThreshold = startingThreshold
+    thresholdStep = thresholdStep
+    minThreshold = minThreshold
+    for t in range(startingThreshold, minThreshold-1, -thresholdStep):
+        threshold = max(1, int(t))
+        fast = cv2.FastFeatureDetector.create(threshold=threshold, nonmaxSuppression=True, type=cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)
+        fast.setThreshold(int(threshold))
+        kps = fast.detect(img)
+        currentFeatures = len(kps)
+        if currentFeatures >= numFeatures:
+            sortedKps = sorted(kps, key=lambda x:x.response, reverse=True)
+            return sortedKps[:numFeatures]
+    sortedKps = sorted(kps, key=lambda x:x.response, reverse=True)
+    #print(f"Final treshold: {threshold} - Number of kps: {currentFeatures}/{numFeatures}")
+    return sortedKps
+
+def FAST_MULTIPROCESSING(img, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=2):
+    currentFeatures = 0
+    startingThreshold = startingThreshold
+    thresholdStep = thresholdStep
+    minThreshold = minThreshold
+    for t in range(startingThreshold, minThreshold-1, -thresholdStep):
+        threshold = max(1, int(t))
+        fast = cv2.FastFeatureDetector.create(threshold=threshold, nonmaxSuppression=True, type=cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)
+        fast.setThreshold(int(threshold))
+        kps = fast.detect(img)
+        currentFeatures = len(kps)
+        if currentFeatures >= numFeatures: return True
+        else: return False
+
+def SEGMENTED_FAST_MULTIPROCESSING(img, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=2):
+    currentFeatures = 0
+    startingThreshold = startingThreshold
+    thresholdStep = thresholdStep
+    minThreshold = minThreshold
+    for t in range(startingThreshold, minThreshold-1, -thresholdStep):
+        threshold = max(1, int(t))
+        fast = cv2.FastFeatureDetector.create(threshold=threshold, nonmaxSuppression=True, type=cv2.FAST_FEATURE_DETECTOR_TYPE_9_16)
+        fast.setThreshold(int(threshold))
+        kps = fast.detect(img)
+        currentFeatures = len(kps)
+        if currentFeatures >= numFeatures:
+            sortedKps = sorted(kps, key=lambda x:x.response, reverse=True)
+            return sortedKps[:numFeatures]
+    sortedKps = sorted(kps, key=lambda x:x.response, reverse=True)
+    #print(f"Final treshold: {threshold} - Number of kps: {currentFeatures}/{numFeatures}")
+    return sortedKps
+
+
+def segmentedFAST_GPU(img, numFeatures, nBlocks=(2,2)): # TODO Update this function
+    numRows, numCols = nBlocks
+    
+    horizontal = np.array_split(img, numRows)
+    splitted_img = [np.array_split(block, numCols, axis=1) for block in horizontal]
+
+    currentOffsetHeight = 0
+    currentOffsetWidth = 0
+    offsetHeights = []
+    offsetWidths = []
+    for row in range(numRows):
+        offsetHeights.append(currentOffsetHeight)
+        currentOffsetHeight += len(splitted_img[row][0])
+
+    for col in range(numCols):
+        offsetWidths.append(currentOffsetWidth)
+        currentOffsetWidth += splitted_img[0][col].shape[1]
+
+    #offsets = np.zeros((numRows, numCols, 2))
     result = []
-    for row in range(imgs.shape[0]):
-        for col in range(imgs.shape[1]):
-            kp = orbDetector(imgs[row][col], numFeatures)
-            print(row, col, len(kp))
-            for p in kp:
-                p.pt = (p.pt[0]+w[col], p.pt[1]+h[row])
-            if len(result): result = np.hstack((result, kp))
-            else: result = kp
+    for row in range(numRows):
+        for col in range(numCols):
+            #offsets[row, col, :] = [offsetHeights[row], offsetWidths[col]]
+            heightOffset = offsetHeights[row]
+            widthOffset = offsetWidths[col]
+            localH, localW = len(splitted_img[row][0]), splitted_img[0][col].shape[1]
+            gpuImg = cv2.cuda.GpuMat(rows=localH, cols=localW, type=cv2.CV_8U)
+            gpuImg.upload(splitted_img[row][col])
+            keypoints = FAST_GPU(gpuImg, numFeatures)
+
+            for kp in keypoints:
+                #print(f"Before: {p.pt}")
+                kp.pt = (kp.pt[0]+widthOffset, kp.pt[1]+heightOffset)
+                #print(f"After: {p.pt}")
+                result.append(kp)
+            #if len(result): result = np.hstack((result, kp))
+            #else: result = keypoints
+    return result
+
+def segmentedFAST_CPU(img, numFeatures, nBlocks=(2,2), startingThreshold=20, thresholdStep=1, minThreshold=4): # TODO Update this function
+    numRows, numCols = nBlocks
+    #FAST_CPU(gpuImg, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=4
+    horizontal = np.array_split(img, numRows)
+    splitted_img = [np.array_split(block, numCols, axis=1) for block in horizontal]
+
+    currentOffsetHeight = 0
+    currentOffsetWidth = 0
+    offsetHeights = []
+    offsetWidths = []
+    for row in range(numRows):
+        offsetHeights.append(currentOffsetHeight)
+        currentOffsetHeight += len(splitted_img[row][0])
+    for col in range(numCols):
+        offsetWidths.append(currentOffsetWidth)
+        currentOffsetWidth += splitted_img[0][col].shape[1]
+    result = []
+    for row in range(numRows):
+        for col in range(numCols):
+            heightOffset = offsetHeights[row]
+            widthOffset = offsetWidths[col]
+            currentImg = splitted_img[row][col]
+            keypoints = FAST_CPU(currentImg, numFeatures, startingThreshold=startingThreshold,
+                                 thresholdStep=thresholdStep, minThreshold=minThreshold)
+            for kp in keypoints:
+                kp.pt = (kp.pt[0]+widthOffset, kp.pt[1]+heightOffset)
+                result.append(kp)
+    return result
+
+def segmentedORBDetect(img, numFeatures, nBlocks=(2,2)):
+    numRows, numCols = nBlocks
+    #FAST_CPU(gpuImg, numFeatures, startingThreshold=20, thresholdStep=1, minThreshold=4
+    horizontal = np.array_split(img, numRows)
+    splitted_img = [np.array_split(block, numCols, axis=1) for block in horizontal]
+
+    currentOffsetHeight = 0
+    currentOffsetWidth = 0
+    offsetHeights = []
+    offsetWidths = []
+    for row in range(numRows):
+        offsetHeights.append(currentOffsetHeight)
+        currentOffsetHeight += len(splitted_img[row][0])
+    for col in range(numCols):
+        offsetWidths.append(currentOffsetWidth)
+        currentOffsetWidth += splitted_img[0][col].shape[1]
+    result = []
+    for row in range(numRows):
+        for col in range(numCols):
+            heightOffset = offsetHeights[row]
+            widthOffset = offsetWidths[col]
+            currentImg = splitted_img[row][col]
+            orbSegments = cv2.ORB.create(nfeatures=numFeatures, firstLevel=2, nlevels=5, fastThreshold=1)
+            
+            keypoints = orbSegments.detect(currentImg, None)
+            for kp in keypoints:
+                kp.pt = (kp.pt[0]+widthOffset, kp.pt[1]+heightOffset)
+                result.append(kp)
+    return result
+
+
+def segmentedORB_GPU(img, numFeatures, nBlocks=(2, 2)):
+    numRows, numCols = nBlocks
+    
+    horizontal = np.array_split(img, numRows)
+    splitted_img = [np.array_split(block, numCols, axis=1) for block in horizontal]
+
+    currentOffsetHeight = 0
+    currentOffsetWidth = 0
+    offsetHeights = []
+    offsetWidths = []
+    for row in range(numRows):
+        offsetHeights.append(currentOffsetHeight)
+        currentOffsetHeight += len(splitted_img[row][0])
+
+    for col in range(numCols):
+        offsetWidths.append(currentOffsetWidth)
+        currentOffsetWidth += splitted_img[0][col].shape[1]
+
+    #offsets = np.zeros((numRows, numCols, 2))
+    result = []
+    for row in range(numRows):
+        for col in range(numCols):
+            #offsets[row, col, :] = [offsetHeights[row], offsetWidths[col]]
+            heightOffset = offsetHeights[row]
+            widthOffset = offsetWidths[col]
+            localH, localW = len(splitted_img[row][0]), splitted_img[0][col].shape[1]
+            gpuImg = cv2.cuda.GpuMat(rows=localH, cols=localW, type=cv2.CV_8U)
+            gpuImg.upload(splitted_img[row][col])
+            keypoints = FAST_GPU(gpuImg, numFeatures)
+
+            offsets = []
+            descriptors = []
+            
     return result
 
 def applyLoG(img, blurWindowSize=(3, 3), type=cv2.CV_8U, _sigma=4):
@@ -201,6 +448,12 @@ def resizeImage(img, ratio, interpol=cv2.INTER_AREA):
     img = cv2.resize(img, (width, height), interpolation = cv2.INTER_AREA)
     return img
 
+def resizeImageGPU(img, ratio, interpol=cv2.INTER_AREA):
+    width, height = img.size()
+    width, height = int(width*ratio), int(height*ratio)
+    img = cv2.cuda.resize(img, (width, height), interpolation = cv2.INTER_AREA)
+    return img
+
 def getMatchesCoordinates(matches, leftKeypoints, rightKeypoints):
     leftCoordinates, rightCoordinates = [], []
     for match in matches:
@@ -209,6 +462,14 @@ def getMatchesCoordinates(matches, leftKeypoints, rightKeypoints):
     return np.array(leftCoordinates), np.array(rightCoordinates)
 
 def getMatchesKeypoints(matches, leftKeypoints, rightKeypoints):
+    matchedLeftKeypoints, matchedRigthKeypoints = [], []
+    for match in matches:
+        matchedLeftKeypoints.append(leftKeypoints[match.queryIdx])
+        matchedRigthKeypoints.append(rightKeypoints[match.trainIdx])
+    return matchedLeftKeypoints, matchedRigthKeypoints
+
+def getMatchesKeypointsGPU(matches, leftKeypoints, rightKeypoints):
+    print(f'Matches: {type(matches[0])}\nLeft keypoints: {type(leftKeypoints)}\nRight keypoints: {type(rightKeypoints)}')
     matchedLeftKeypoints, matchedRigthKeypoints = [], []
     for match in matches:
         matchedLeftKeypoints.append(leftKeypoints[match.queryIdx])
@@ -315,6 +576,410 @@ def evaluateStereoRactification(imgLeft, imgRight, numMatches):
     #plt.subplot(122), plt.imshow(img3)
     plt.show()
 
-def cannyEdgeDetection(img, title = 'Canny Edge Detector', showImg = True):     # TODO
-    # https://www.youtube.com/watch?v=hUC1uoigH6s&list=PL2zRqk16wsdqXEMpHrc4Qnb5rA1Cylrhx&index=5
-    pass
+def getMap(fileName, dtype=np.uint8):
+    with rasterio.open(fileName, 'r') as ds:
+        img = ds.read()[0]  # read all raster values
+    return np.matrix(img, dtype=dtype)
+
+def cutSubregion(map, x0, y0, x1, y1):
+    return map[int(y0):int(y1), int(x0):int(x1)]
+
+def cutSubregionGPU(map, x0, y0, x1, y1):
+    croppedMap = cv2.cuda_GpuMat(map, [y0, y1], [x0, x1])
+    return croppedMap
+
+def applyNoise(img, std, dtype=np.float32):
+    h, w = img.shape
+    noisyImg = np.random.randn(h, w)
+    noisyImg = np.float32(noisyImg*std + img)
+    assert noisyImg.dtype == dtype, f"In applyNoise function: Expected dtype {dtype}, result is {noisyImg.dtype}."
+    return noisyImg
+
+def applyNoiseGPU(img, std=1):
+    w, h = img.size()
+    np_img = img.download()
+    noisyImg = np.random.randn(h, w)
+    noisyImg = noisyImg*std + np_img
+    #noisyImg = np.uint8(noisyImg)
+    noisyImg = np.float32(noisyImg)
+    result = cv2.cuda_GpuMat(noisyImg)
+    return result
+
+def drawRectangle(img, x0, y0, x1, y1, color=(255, 255, 255)):     # TODO finish this function
+    height, width = img.shape
+    if width >= height: max = width
+    else:  max = height
+    thickness = int(max*0.001)
+    img = cv2.rectangle(img, (x0, y0), (x1, y1), color, thickness)
+    return img
+
+def showSliceOfImg(img, x0=0.5, show=True):
+    h, w = img.shape
+    slice = img[:, int(x0*w)]
+    if show:
+        plt.plot(slice)
+        plt.grid()
+        plt.show()
+    return slice
+
+def insidePolygon(p, x0, y0, x1, y1):   # TODO Not being used?
+    xp, yp = p
+    point = Point(xp, yp)
+    polygon = Polygon([(x0, y0), (x0, y1), (x1, y1), (x1, y0)])
+    return polygon.contains(point)
+
+def rotateMap(map, deg):
+    height, width = map.shape
+    cr = (width/2,height/2)     # define center of rotation
+    M = cv2.getRotationMatrix2D(cr,deg,1)    # 'deg' in anticlockwise direction
+    return cv2.warpAffine(map,M,(width,height))  # apply warpAffine() method to perform image rotation
+
+def rotateMapGPU(map, deg):
+    width, height = map.size()
+    cr = (width/2,height/2)     # define center of rotation
+    M = cv2.getRotationMatrix2D(cr,deg,1)    # 'deg' in anticlockwise direction
+    return cv2.cuda.warpAffine(map,M,(width,height))  # apply warpAffine() method to perform image rotation
+
+def plotSideBySide(data1, data2):
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    ax1.plot(data1)
+    ax2.plot(data2)
+    plt.grid()
+    plt.plot()
+
+def rotate2DRectangle(x0, x1, y0, y1, cx, cy, deg):
+    points = np.array([[x0, y0], [x0, y1], [x1, y1], [x1, y0]])
+    return rotateAroundCenter(points, cx, cy, deg)
+     
+def drawPolygon(img, pts, color=(255, 0, 0)):
+    img = np.int32(img)
+    height, width = img.shape
+    if width >= height: max = width
+    else:  max = height
+    thickness = int(max*0.003)
+    img = cv2.polylines(img, np.int32([pts]), 1, color=color, thickness=thickness)
+    return np.uint8(img)
+
+def rotateAroundCenter(pts, cx, cy, ang):
+    radians = np.radians(ang)
+    cos, sin = math.cos(radians), math.sin(radians)
+    rotPts = []
+    for p in pts:
+        x, y = p
+        rx = cx + cos * (x - cx) + sin * (y - cy)
+        ry = cy + -sin * (x - cx) + cos * (y - cy)
+        rotPts.append([rx, ry])
+    return np.array(rotPts)
+
+def countInliers(matches, pts):
+    inliers = 0
+    for match in matches:
+        point = Point(match.pt[0], match.pt[1])
+        polygon = Polygon(pts)
+        if polygon.contains(point): inliers += 1
+    return inliers
+
+def calcInitialLevel(imgShape, scaleFactor, desiredInitialArea):
+    A = imgShape[0]*imgShape[1]
+    return int(math.log(desiredInitialArea/A, scaleFactor)/2)
+
+def calcNumberLevels(imgShape, scaleFactor, initialLevel, desiredFinalArea):
+    '''Used to calculate pyramid parameters in
+    ORB Detector.'''
+    A = imgShape[0]*imgShape[1]
+    return int(math.log(A/desiredFinalArea, scaleFactor)/2 + initialLevel)
+
+def performanceData(hist, title):
+    title = f"\n{'='*10} {title} {'='*10}"
+    print(title)
+    mean, std = np.mean(hist), np.std(hist)
+    print(f" Média = {mean}\n Std dev = {std}\n{len(title)*'='}\n") 
+
+    return mean, std
+
+def getCoord(kp):
+    x, y = kp.pt[0], kp.pt[1]
+    return x, y
+
+def countSuccessfullMatches(final_matches, imgKeypoints, subKeypoints, resizeScale, x0, y0, cx, cy, rotAngle, thresholdRadius=5, showData=False):
+    '''
+    Function used to calculate how many matches were truly successful.
+    
+    It verifies that the distance [px] between real point (in greater map)
+    and predicted point (sub-region) is smaller than thresholdRadius [px]
+
+    x0, y0: used to calculate sub-region position in greater map.
+    cx, cy: center of the greater map (width/2, height/2).
+    rotAngle: the angle that greater map was rotated to extract sub-region.
+    '''
+    matchedImg, matchedSub = getMatchesKeypoints(final_matches, imgKeypoints, subKeypoints)
+    counter = 0
+    for i in range(len(final_matches)):
+        img_x, img_y = getCoord(matchedImg[i])
+        sub_x, sub_y = getCoord(matchedSub[i])
+        sub_x, sub_y = int(sub_x*resizeScale + x0), int(sub_y*resizeScale + y0)
+        [[sub_x, sub_y]] = rotateAroundCenter([[sub_x, sub_y]], cx, cy, -rotAngle)
+        delta_x, delta_y = abs(img_x-sub_x), abs(img_y-sub_y)
+        if showData: print("X: ", int(delta_x), "y: ", int(delta_y))
+        if math.sqrt(delta_x**2 + delta_y**2) <= thresholdRadius: counter += 1
+    return counter
+
+def computeScore(final_matches, imgKeypoints, subKeypoints, resizeScale, x0, y0, cx, cy, rotAngle, thresholdRadius=5):
+    '''
+    Function used to calculate how many matches were truly successful.
+    
+    It verifies that the distance [px] between real point (in greater map)
+    and predicted point (sub-region) is smaller than thresholdRadius [px]
+
+    x0, y0: used to calculate sub-region position in greater map.
+    cx, cy: center of the greater map (width/2, height/2).
+    rotAngle: the angle that greater map was rotated to extract sub-region.
+    '''
+    matchedImg, matchedSub = getMatchesKeypoints(final_matches, imgKeypoints, subKeypoints)
+    score, inliers = 0, 0
+    bestMatches = 0
+    for i in range(len(final_matches)):
+        img_x, img_y = getCoord(matchedImg[i])
+        sub_x, sub_y = getCoord(matchedSub[i])
+        sub_x, sub_y = int(sub_x*resizeScale + x0), int(sub_y*resizeScale + y0)
+        [[sub_x, sub_y]] = rotateAroundCenter([[sub_x, sub_y]], cx, cy, -rotAngle)
+        delta_x, delta_y = abs(img_x-sub_x), abs(img_y-sub_y)
+
+        bValidPoint = math.sqrt(delta_x**2 + delta_y**2) <= thresholdRadius
+        distance = final_matches[i].distance
+        score += bValidPoint*256 - distance
+        inliers += bValidPoint
+        if i < 10 and bValidPoint: bestMatches += 1
+    #return score, inliers
+    return score, inliers, bestMatches
+
+def computeMatchesScore(final_matches, imgKeypoints, subKeypoints, resizeScale, x0, y0, cx, cy, rotAngle, thresholdRadius, matcherType, pitch, roll, numBestMatches, bestMatchesMultiplier=3):
+    # TODO Melhor função objetivo até agora
+    '''
+    Function used to calculate how many matches were truly successful.
+    
+    It verifies that the distance [px] between real point (in greater map)
+    and predicted point (sub-region) is smaller than thresholdRadius [px]
+
+    x0, y0: used to calculate sub-region position in greater map.
+    cx, cy: center of the greater map (width/2, height/2).
+    rotAngle: the angle that greater map was rotated to extract sub-region.
+    pitch/roll: angles applied in sub-region distortion.
+    '''
+    matchedImg, matchedSub = getMatchesKeypoints(final_matches, imgKeypoints, subKeypoints)
+    score, inliers, bestMatches = 0, 0, 0
+    cx, cy = round(cx/resizeScale), round(cy/resizeScale)
+    for i in range(len(final_matches)):
+        img_x, img_y = getCoord(matchedImg[i])
+        img_x, img_y = round(img_x/resizeScale), round(img_y/resizeScale)
+        sub_x, sub_y = getCoord(matchedSub[i])
+        sub_x, sub_y = sub_x / math.cos(math.radians(roll)), sub_y / math.cos(math.radians(pitch))
+        sub_x, sub_y = round(sub_x + x0/resizeScale), round(sub_y + y0/resizeScale)
+        [[sub_x, sub_y]] = rotateAroundCenter([[sub_x, sub_y]], cx, cy, -rotAngle)
+        delta_x, delta_y = abs(img_x-sub_x), abs(img_y-sub_y)
+        bValidPoint = math.floor(math.sqrt(delta_x**2 + delta_y**2)) <= thresholdRadius
+        distance = final_matches[i].distance
+        if matcherType == cv2.NORM_HAMMING:
+            currentScore = (bValidPoint*(256-distance))**2
+        elif matcherType == cv2.NORM_HAMMING2:
+            currentScore = bValidPoint*(65536-distance)
+        inliers += bValidPoint
+        if i < numBestMatches and bValidPoint:
+            bestMatches += 1
+            currentScore *= bestMatchesMultiplier
+        score += currentScore
+    return score, inliers, bestMatches
+
+def minimizeAllMatches(final_matches, imgKeypoints, subKeypoints, resizeScale, x0, y0, cx, cy, rotAngle, thresholdRadius=5):
+    # TODO Muito ruim essa função objetivo
+    '''
+    Function used to calculate how many matches were truly successful.
+    
+    It verifies that the distance [px] between real point (in greater map)
+    and predicted point (sub-region) is smaller than thresholdRadius [px]
+
+    x0, y0: used to calculate sub-region position in greater map.
+    cx, cy: center of the greater map (width/2, height/2).
+    rotAngle: the angle that greater map was rotated to extract sub-region.
+    '''
+    matchedImg, matchedSub = getMatchesKeypoints(final_matches, imgKeypoints, subKeypoints)
+    score, inliers = 0, 0
+    bestMatches = 0
+    for i in range(len(final_matches)):
+        img_x, img_y = getCoord(matchedImg[i])
+        sub_x, sub_y = getCoord(matchedSub[i])
+        sub_x, sub_y = int(sub_x*resizeScale + x0), int(sub_y*resizeScale + y0)
+        [[sub_x, sub_y]] = rotateAroundCenter([[sub_x, sub_y]], cx, cy, -rotAngle)
+        delta_x, delta_y = abs(img_x-sub_x), abs(img_y-sub_y)
+
+        bValidPoint = math.sqrt(delta_x**2 + delta_y**2) <= thresholdRadius
+        distance = final_matches[i].distance
+        score += 256 - distance
+        inliers += bValidPoint
+        if i < 10 and bValidPoint: bestMatches += 1
+    #return score, inliers
+    return score, inliers, bestMatches
+
+def applyPlaneDistortion(img, pitch, roll, z0=0, interpolationScale=5, dtype=np.float32):
+    y0 = -math.tan(math.radians(pitch))
+    x0 = -math.tan(math.radians(roll))
+    h, w = img.shape
+    scale = interpolationScale
+    img = cv2.resize(img, (w*scale, h*scale), cv2.INTER_CUBIC)  # INTER_CUBIC to enlarge image
+    x0, y0 = x0/scale, y0/scale
+    plane = np.fromfunction(lambda y, x: y0*y + x0*x, img.shape, dtype=dtype)
+    result = plane + img
+    result = cv2.resize(result, (int(w*math.cos(math.radians(roll))), int(h*math.cos(math.radians(pitch)))), cv2.INTER_AREA) # INTER_AREA to shrink an image.
+    assert result.dtype == dtype, "dtype missmatch in applyPlaneDistortion function calculation."
+    return result
+
+def applyPlaneDistortionGPU(img, pitch, roll, z0=0, interpolationScale=5):
+    y0 = -math.tan(math.radians(pitch))
+    x0 = -math.tan(math.radians(roll))
+    w, h = img.size()
+    scale = interpolationScale
+    img = cv2.cuda.resize(img, (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)  # INTER_CUBIC to enlarge image
+    x0, y0 = x0/scale, y0/scale
+    scaled_w, scaled_h = img.size()
+    plane_np = np.fromfunction(lambda y, x: y0*y + x0*x, (scaled_h, scaled_w), dtype=float)
+    img_np = img.download()
+    img_np = img_np + plane_np
+    result = cv2.resize(img_np, (w, h), cv2.INTER_AREA) # INTER_AREA to shrink an image.
+    result = cv2.cuda_GpuMat(img_np)
+    return result
+
+def fitImage_UINT8(img):
+    '''
+    Fit image in uint8 (0, 255, 1) format.
+    '''
+    minValue = np.min(img)
+    maxValue = np.max(img)
+    delta = maxValue-minValue
+    img = 255*((img-minValue)/delta)
+    img = np.clip(np.round(img), 0, 255).astype(np.uint8)
+    return img
+
+@vectorize(["uint8(float32, float32, float32)"], target='cuda')
+def float32_to_uint8_GPU(img, min, max):
+    delta = max-min
+    img = round(255*((img-min)/delta))
+    return img
+
+def float32_to_uint8_CPU(img, min, max):
+    '''
+    Fit image in uint8 (0, 255, 1) format.
+    '''
+    delta = max-min
+    img = np.round(255*((img-min)/delta)).astype(np.uint8)
+    return img
+
+def calculateNumberOfBlocks(lenghtInPixels, img):
+    h, w = img.shape
+    nBlocksY = round(h/lenghtInPixels)
+    nBlocksX = round(w/lenghtInPixels)
+    return (nBlocksY, nBlocksX)
+
+def getBoundaries(spacesArr):
+    '''
+        Get lower and upper boundary values for Latin Hypercube.
+    '''
+    lowerBoundaries, upperBoundaries = [], []
+    lowerBoundaries = np.zeros(len(spacesArr))
+    for space in spacesArr:
+        upper = len(space)-1
+        upperBoundaries.append(upper)
+    return lowerBoundaries, upperBoundaries
+
+def generatePopulation(numPop, SPACE):
+    lowerBoundaries, upperBoundaries = getBoundaries(SPACE)
+    sampler = qmc.LatinHypercube(d=len(SPACE))
+    initialPopulation = sampler.random(n=numPop)
+    initialPopulation = qmc.scale(initialPopulation, lowerBoundaries, upperBoundaries)
+    for individual in initialPopulation:
+        for i in range(len(individual)):
+            individual[i] = SPACE[i][round(individual[i])]
+    return initialPopulation
+
+def listReferences(object):
+    references = list(gc.get_referrers(object))
+    for i, reference in references:
+        print(f"Reference {i}: {reference}")
+    print(f"\tReference count: {sys.getrefcount(object)}")
+
+@vectorize(["float32(float32, float32)"], target='cuda')       
+def calculate_mape_vectorized(map_val, noisy_map_val):
+    """
+    Vectorized function to calculate Mean Absolute Percentage Error (MAPE) between two values.
+
+    Parameters:
+    - map_val: Value from the original image.
+    - noisy_map_val: Value from the noisy image.
+
+    Returns:
+    - mape: Mean Absolute Percentage Error.
+    """
+    return abs((map_val - noisy_map_val) / (map_val + 1e-8)) * 100.0
+
+def calculate_mape(map_data, noisy_map_data):
+    """
+    Calculate Mean Absolute Percentage Error (MAPE) between two images.
+
+    Parameters:
+    - map_data: 2D NumPy array representing the original image.
+    - noisy_map_data: 2D NumPy array representing the noisy image.
+
+    Returns:
+    - mape: Mean Absolute Percentage Error.
+    """
+    # Ensure images have the same shape
+    assert map_data.shape == noisy_map_data.shape, "Images must have the same shape."
+
+    # Use the vectorized function directly on the arrays
+    abs_percentage_error = calculate_mape_vectorized(map_data, noisy_map_data)
+
+    # Calculate mean absolute percentage error
+    total_pixels = map_data.size
+    mape_sum = np.sum(abs_percentage_error)
+
+    mape = mape_sum / total_pixels
+
+    return mape
+
+@vectorize(["float32(float32, float32)"], target='cuda')   
+def calculate_rmse_vectorized(map_val, noisy_map_val):
+    """
+    Vectorized function to calculate squared error between two values.
+
+    Parameters:
+    - map_val: Value from the original image.
+    - noisy_map_val: Value from the noisy image.
+
+    Returns:
+    - squared_error: Squared error.
+    """
+    return (map_val - noisy_map_val)**2
+
+def calculate_rmse(map_data, noisy_map_data):
+    """
+    Calculate Root Mean Squared Error (RMSE) between two images.
+
+    Parameters:
+    - map_data: 2D NumPy array representing the original image.
+    - noisy_map_data: 2D NumPy array representing the noisy image.
+
+    Returns:
+    - rmse: Root Mean Squared Error.
+    """
+    # Ensure images have the same shape
+    assert map_data.shape == noisy_map_data.shape, "Images must have the same shape."
+
+    # Use the vectorized function directly on the arrays
+    squared_error = calculate_rmse_vectorized(map_data.flatten(), noisy_map_data.flatten())
+
+    # Calculate mean squared error
+    mse = np.mean(squared_error)
+
+    # Calculate RMSE
+    rmse = np.sqrt(mse)
+
+    return rmse
